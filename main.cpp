@@ -3,6 +3,8 @@
 #include <list>
 #include <chrono>
 
+#include "skiplist.h"
+
 #include <cstdlib>
 #include <ctime>
 #include <cmath>
@@ -14,12 +16,15 @@ struct point {
     int y;
 };
 
+template <typename T>
+using sl_value_t = const struct point<T>;
+
 template <typename IdType>
 struct fence {
     int start;
     int end;
 
-    std::list<const struct point<IdType>*> points;
+    SkipList<sl_value_t<IdType>*, 3> sl;
 };
 
 template <typename IdType, int size, int spacing>
@@ -27,10 +32,6 @@ class Axis {
 public:
     static int coordinate_to_fence_index(const int& coordinate) {
         return coordinate / spacing;
-    }
-
-    static bool fence_index_changed(const int& c1, const int& c2) {
-        return coordinate_to_fence_index(c1) != coordinate_to_fence_index(c2);
     }
 
     constexpr static int fence_count() {
@@ -64,7 +65,7 @@ public:
                                           std::list<const struct fence<IdType>*>& fence_sets) = 0;
 
     void do_find(const int& coordinate, const int& distance,
-                                  std::list<const struct fence<IdType>*>& fence_sets) {
+                 std::list<const struct fence<IdType>*>& fence_sets) {
         auto min_coor = coordinate - distance;
         if(min_coor<0) min_coor=0;
         auto max_coor = coordinate + distance;
@@ -87,27 +88,30 @@ class XAxis : public Axis<IdType, size, spacing> {
 public:
     void put(const struct point<IdType> *p) override {
         auto index = this->coordinate_to_fence_index(p->x);
-        this->axis_[index]->points.push_back(p);
+        this->axis_[index]->sl.insert(p->y, p);
     }
 
     void remove(const struct point<IdType> *p) override {
         auto index = this->coordinate_to_fence_index(p->x);
-        this->axis_[index]->points.remove(p);
+        this->axis_[index]->sl.remove(p->y, p);
     }
 
     void find_neighborhood_fences(const struct point<IdType> *p, const int &distance,
-                                  std::list<const struct fence<IdType> *> &fence_sets) override {
+                                  std::list<const struct fence<IdType>*>& fence_sets) override {
         this->do_find(p->x, distance, fence_sets);
     }
 };
 
-// implement the XAxis
 
 template <typename IdType, int size, int spacing>
 class Area
 {
 public:
-    Area(): size_(size) {}
+    Area() {}
+
+    Area(const Area<IdType, size, spacing>&) = delete;
+    Area&operator=(const Area<IdType, size, spacing>&) = delete;
+    Area(Area<IdType, size, spacing>&&) = delete;
 
     ~Area() {
         for(auto& iter: position_) {
@@ -117,8 +121,8 @@ public:
         position_.clear();
     }
 
-    int get_size() {
-        return size_;
+    int get_size() const {
+        return size;
     }
 
     void leave(IdType id) {
@@ -141,13 +145,12 @@ public:
             x_axis_.put(p);
         } else {
             auto p = position_[id];
-            if(Axis<IdType, size, spacing>::fence_index_changed(p->x, x)) {
-                x_axis_.remove(p);
-                x_axis_.put(p);
-            }
+            x_axis_.remove(p);
 
             p->x = x;
             p->y = y;
+
+            x_axis_.put(p);
         }
     }
 
@@ -157,17 +160,22 @@ public:
 
         x_axis_.find_neighborhood_fences(p, radius, x_fence_sets);
 
-        int r2 = pow(radius, 2);
-        for(auto fence : x_fence_sets) {
-            for(auto this_p : fence->points) {
-                if(this_p->id == id) continue;
+        int r2 = radius*radius;
+        int x_diff;
+        int y_diff;
 
-                auto y_diff = abs(this_p->y - p->y);
-                if(y_diff > radius) continue;
-
-                if((pow(abs(this_p->x - p->x), 2) + pow(y_diff, 2)) <= r2) {
-                    result.push_back(this_p->id);
+        for(const struct fence<IdType>* fence : x_fence_sets) {
+            slNode<sl_value_t<IdType>*>* node = fence->sl.find_node(p->y-radius);
+            while (node->forward && node->forward->key <= p->y+radius) {
+                if(node->value->id != id) {
+                    x_diff = abs(node->value->x - p->x);
+                    y_diff = abs(node->value->y - p->y);
+                    if((x_diff*x_diff + y_diff*y_diff) <= r2) {
+                        result.push_back(node->value->id);
+                    }
                 }
+
+                node = node->forward;
             }
         }
     }
@@ -206,7 +214,6 @@ public:
 
 
 private:
-    const int size_;
     std::map<IdType, struct point<IdType>*> position_;
     XAxis<IdType, size, spacing> x_axis_;
 };
@@ -215,21 +222,50 @@ private:
 int main(int argc, char* argv[]) {
     int amount = atoi(argv[1]);
     int radius = atoi(argv[2]);
+    int times = atoi(argv[3]);
+    float cost, total_cost=0.f;
 
-    Area<int, 10000, 100> area;
+    Area<int, 20000, 100> area;
 
-    auto c1 = area.benchmark_update(amount);
-    auto c2 =  area.benchmark_aoi(amount, radius);
+    for(int i =0; i< times; i++) {
+        auto c1 = area.benchmark_update(amount);
+        auto c2 =  area.benchmark_aoi(amount, radius);
 
-    printf("move cost: %ld us\n", c1);
-    printf("aoi cost: %ld us\n", c2);
+        printf("move cost: %ld us\n", c1);
+        printf("aoi cost: %ld us\n", c2);
 
-    printf("total cost: %f ms\n", (c1+c2)/1000.0f);
+        cost = (c1+c2)/1000.0f;
+        printf("total cost: %f ms\n", cost);
+
+        total_cost += cost;
+    }
+
+    printf("average: %f\n", total_cost / times);
+
+
+//    SkipList<int, 3> sl;
+//    sl.insert(1, 1);
+//    sl.insert(10, 10);
+//    sl.insert(5, 5);
+//    sl.insert(6, 6);
+//    sl.insert(6, 61);
 //
+//    auto x = sl.find_node(0);
+//    while (x->forward) {
+//        printf("[%d, %d]; ", x->key, x->value);
+//        x = x->forward;
+//    }
+//
+//    printf("\n");
+
+
+//
+
 //    area.update(1, 0, 0);
 //    area.update(2, 10, 10);
 //    area.update(3, 50, 50);
 //    area.update(4, 10, 60);
+//
 //
 //    std::list<int> result;
 //
@@ -243,6 +279,7 @@ int main(int argc, char* argv[]) {
 //    result.clear();
 //
 //    area.update(2, 31, 31);
+//
 //    area.aoi(2, 45, result);
 //    printf("AOI\n");
 //    for(auto& i: result) {
